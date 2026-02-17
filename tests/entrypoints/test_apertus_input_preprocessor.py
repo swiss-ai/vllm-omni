@@ -1,7 +1,9 @@
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
 from vllm_omni.inputs.apertus_preprocess import (
     ApertusOmniInputPreprocessor,
@@ -132,3 +134,130 @@ def test_process_apertus_text_sets_add_special_tokens_false_by_default(monkeypat
     assert inputs["prompt_token_ids"] == [1, 2, 3]
     assert captured["prompt_text"] == "hello <img_prompt>"
     assert captured["tokenization_kwargs"]["add_special_tokens"] is False
+
+
+def test_encode_apertus_images_reads_prompt_from_sqlite_cache_without_encoder(monkeypatch, tmp_path):
+    preprocessor = object.__new__(ApertusOmniInputPreprocessor)
+    preprocessor.tokenizer = SimpleNamespace(
+        boi_token="<|image start|>",
+        img_token="<|image token|>",
+        eol_token="<|extra_200|>",
+        eoi_token="<|image end|>",
+    )
+    image = Image.new("RGB", (16, 16), color=(64, 128, 192))
+    mm_processor_kwargs = {
+        "apertus_min_pixels": 256,
+        "apertus_max_pixels": 256,
+        "apertus_image_token_cache": True,
+        "apertus_image_token_cache_dir": str(tmp_path / "apertus_cache"),
+    }
+    cache_db_path = preprocessor._resolve_apertus_image_token_cache_db_path(mm_processor_kwargs)
+    assert cache_db_path is not None
+
+    resized_image = preprocessor._smart_resize(
+        image,
+        area=256,
+        ds_factor=preprocessor._APERTUS_EMU35_DS_FACTOR,
+    )
+    cache_key = preprocessor._build_apertus_image_prompt_cache_key(
+        resized_image,
+        mm_processor_kwargs=mm_processor_kwargs,
+        min_pixels=256,
+        max_pixels=256,
+    )
+    expected_prompt = "<cached-image-prompt>"
+    preprocessor._store_apertus_image_prompt_in_cache(cache_db_path, cache_key, expected_prompt)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("vision tokenizer should not be loaded when cache hit exists")
+
+    monkeypatch.setattr(preprocessor, "_get_apertus_vision_components", _fail_if_called)
+
+    image_prompts = preprocessor._encode_apertus_images_to_strings(
+        [image],
+        mm_processor_kwargs=mm_processor_kwargs,
+    )
+    assert image_prompts == [expected_prompt]
+
+
+def test_encode_apertus_images_writes_sqlite_cache_and_reuses_it(monkeypatch, tmp_path):
+    preprocessor = object.__new__(ApertusOmniInputPreprocessor)
+    preprocessor.tokenizer = SimpleNamespace(
+        boi_token="<|image start|>",
+        img_token="<|image token|>",
+        eol_token="<|extra_200|>",
+        eoi_token="<|image end|>",
+    )
+    image = Image.new("RGB", (16, 16), color=(32, 64, 96))
+    mm_processor_kwargs = {
+        "apertus_min_pixels": 256,
+        "apertus_max_pixels": 256,
+        "apertus_image_token_cache": True,
+        "apertus_image_token_cache_dir": str(tmp_path / "apertus_cache"),
+    }
+
+    class _FakeVisionTokenizer:
+        def __init__(self):
+            self._param = torch.nn.Parameter(torch.zeros(1))
+            self.encode_calls = 0
+
+        def parameters(self):
+            return iter((self._param,))
+
+        def encode(self, *_args, **_kwargs):
+            self.encode_calls += 1
+            return torch.tensor([[1]], dtype=torch.int64)
+
+    fake_vision_tokenizer = _FakeVisionTokenizer()
+    monkeypatch.setattr(
+        preprocessor,
+        "_get_apertus_vision_components",
+        lambda _kwargs: fake_vision_tokenizer,
+    )
+    monkeypatch.setattr(
+        preprocessor,
+        "_extract_emu35_token_grid",
+        lambda encode_out, token_height, token_width: torch.tensor([[5]], dtype=torch.int64),
+    )
+
+    first = preprocessor._encode_apertus_images_to_strings(
+        [image],
+        mm_processor_kwargs=mm_processor_kwargs,
+    )
+    assert fake_vision_tokenizer.encode_calls == 1
+
+    cache_db_path = preprocessor._resolve_apertus_image_token_cache_db_path(mm_processor_kwargs)
+    assert cache_db_path is not None
+    resized_image = preprocessor._smart_resize(
+        image,
+        area=256,
+        ds_factor=preprocessor._APERTUS_EMU35_DS_FACTOR,
+    )
+    cache_key = preprocessor._build_apertus_image_prompt_cache_key(
+        resized_image,
+        mm_processor_kwargs=mm_processor_kwargs,
+        min_pixels=256,
+        max_pixels=256,
+    )
+    assert cache_db_path.exists()
+    with sqlite3.connect(cache_db_path) as conn:
+        row = conn.execute(
+            f"""
+            SELECT image_prompt
+            FROM {preprocessor._APERTUS_IMAGE_TOKEN_CACHE_TABLE}
+            WHERE cache_key = ?
+            """,
+            (cache_key,),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == first[0]
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("vision tokenizer should not be loaded on second call")
+
+    monkeypatch.setattr(preprocessor, "_get_apertus_vision_components", _fail_if_called)
+    second = preprocessor._encode_apertus_images_to_strings(
+        [image],
+        mm_processor_kwargs=mm_processor_kwargs,
+    )
+    assert second == first
