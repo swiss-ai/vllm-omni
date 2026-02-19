@@ -13,6 +13,10 @@ from vllm.inputs.data import TextPrompt
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalInputs, MultiModalUUIDDict
 
+from vllm_omni.inputs.apertus_utils import (
+    build_emu35_vision_tokenizer,
+    dump_apertus_prompt_debug,
+)
 from vllm_omni.inputs.data import OmniTokenInputs, token_inputs_omni
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.model_executor.stage_input_processors.apertus import merge_image_placeholders
@@ -51,6 +55,12 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
     _APERTUS_DEFAULT_IMAGE_PLACEHOLDER = "<|image|>"
     _APERTUS_VISUAL_TEMPLATE = "<|visual token {token_id}|>"
     _APERTUS_EMU35_DS_FACTOR = 16
+    _APERTUS_DEFAULT_BOS_TOKEN = "<|bos|>"
+    _APERTUS_DEFAULT_BOI_TOKEN = "<|img_start|>"
+    _APERTUS_DEFAULT_IMG_TOKEN = "<|img_token_start|>"
+    _APERTUS_DEFAULT_EOL_TOKEN = "<|img_end_of_row|>"
+    _APERTUS_DEFAULT_EOF_TOKEN = "<|img_end_of_frame|>"
+    _APERTUS_DEFAULT_EOI_TOKEN = "<|img_end|>"
     _APERTUS_IMAGE_TOKEN_CACHE_VERSION = 1
     _APERTUS_IMAGE_TOKEN_CACHE_ENV_VAR = "VLLM_OMNI_APERTUS_IMAGE_TOKEN_CACHE_DIR"
     _APERTUS_IMAGE_TOKEN_CACHE_DEFAULT_DIR = "/iopsstor/scratch/cscs/$USER/swissai/cache/image_tokens/"
@@ -59,7 +69,7 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._apertus_vision_encoder_cache: dict[tuple[str, str, torch.dtype, bool], Any] = {}
+        self._apertus_vision_encoder_cache: dict[tuple[str, str, str, torch.dtype, bool], Any] = {}
         self._apertus_image_token_cache_db_path: Path | None = None
         self._apertus_image_token_cache_conn: sqlite3.Connection | None = None
 
@@ -197,16 +207,40 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
 
         return token.to(dtype=torch.int64)
 
+    def _load_vision_tokenizer(self, vq_hub: str, device: str, **kwargs: Any) -> Any:
+        """Load Emu3.5 IBQ vision tokenizer from local files or HF repo."""
+        if "torch_dtype" in kwargs:
+            kwargs["dtype"] = kwargs.pop("torch_dtype")
+
+        vq_type = str(kwargs.pop("type", kwargs.pop("vq_type", "ibq")))
+        vision_tokenizer = build_emu35_vision_tokenizer(
+            vq_hub=vq_hub,
+            default_repo=self._APERTUS_DEFAULT_VQ_HUB,
+            device=device,
+            vq_type=vq_type,
+            **kwargs,
+        )
+
+        dtype = kwargs.get("dtype")
+        if isinstance(dtype, torch.dtype):
+            vision_tokenizer = vision_tokenizer.to(dtype=dtype)
+
+        return vision_tokenizer
+
     def _get_apertus_vision_components(
         self,
         mm_processor_kwargs: Mapping[str, Any],
     ) -> Any:
-        from transformers import AutoModel
-
         vq_hub = str(
             mm_processor_kwargs.get(
                 "apertus_vq_hub",
                 mm_processor_kwargs.get("vq_hub", self._APERTUS_DEFAULT_VQ_HUB),
+            )
+        )
+        vq_type = str(
+            mm_processor_kwargs.get(
+                "apertus_vq_type",
+                mm_processor_kwargs.get("vq_type", "ibq"),
             )
         )
         min_pixels = self._coerce_int(
@@ -230,16 +264,17 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
         trust_remote_code = bool(mm_processor_kwargs.get("apertus_vq_trust_remote_code", True))
 
         del min_pixels, max_pixels
-        cache_key = (vq_hub, vision_device, vision_dtype, trust_remote_code)
+        cache_key = (vq_hub, vq_type, vision_device, vision_dtype, trust_remote_code)
         if cache_key in self._apertus_vision_encoder_cache:
             return self._apertus_vision_encoder_cache[cache_key]
 
-        vision_tokenizer = AutoModel.from_pretrained(
-            vq_hub,
-            trust_remote_code=trust_remote_code,
+        vision_tokenizer = self._load_vision_tokenizer(
+            vq_hub=vq_hub,
+            device=vision_device,
+            type=vq_type,
             torch_dtype=vision_dtype,
-        ).eval()
-        vision_tokenizer = vision_tokenizer.to(vision_device)
+            trust_remote_code=trust_remote_code,
+        )
 
         self._apertus_vision_encoder_cache[cache_key] = vision_tokenizer
         return vision_tokenizer
@@ -314,6 +349,12 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
                 mm_processor_kwargs.get("vq_hub", self._APERTUS_DEFAULT_VQ_HUB),
             )
         )
+        vq_type = str(
+            mm_processor_kwargs.get(
+                "apertus_vq_type",
+                mm_processor_kwargs.get("vq_type", "ibq"),
+            )
+        )
         vision_device = str(mm_processor_kwargs.get("apertus_vision_tokenizer_device", "cpu"))
         vision_dtype = self._coerce_dtype(mm_processor_kwargs.get("apertus_vision_tokenizer_dtype"))
         if vision_device == "cpu" and vision_dtype in (torch.float16, torch.bfloat16):
@@ -322,6 +363,7 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
         hash_payload = {
             "cache_version": self._APERTUS_IMAGE_TOKEN_CACHE_VERSION,
             "vq_hub": vq_hub,
+            "vq_type": vq_type,
             "vision_device": vision_device,
             "vision_dtype": str(vision_dtype),
             "trust_remote_code": trust_remote_code,
@@ -329,10 +371,12 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
             "max_pixels": max_pixels,
             "ds_factor": self._APERTUS_EMU35_DS_FACTOR,
             "visual_template": self._APERTUS_VISUAL_TEMPLATE,
-            "boi_token": self._apertus_special_token("boi_token", "<|image start|>"),
-            "img_token": self._apertus_special_token("img_token", "<|image token|>"),
-            "eol_token": self._apertus_special_token("eol_token", "<|extra_200|>"),
-            "eoi_token": self._apertus_special_token("eoi_token", "<|image end|>"),
+            "bos_token": self._apertus_special_token("bos_token", self._APERTUS_DEFAULT_BOS_TOKEN),
+            "boi_token": self._apertus_special_token("boi_token", self._APERTUS_DEFAULT_BOI_TOKEN),
+            "img_token": self._apertus_special_token("img_token", self._APERTUS_DEFAULT_IMG_TOKEN),
+            "eol_token": self._apertus_special_token("eol_token", self._APERTUS_DEFAULT_EOL_TOKEN),
+            "eof_token": self._apertus_special_token("eof_token", self._APERTUS_DEFAULT_EOF_TOKEN),
+            "eoi_token": self._apertus_special_token("eoi_token", self._APERTUS_DEFAULT_EOI_TOKEN),
             "resized_mode": resized_image.mode,
             "resized_size": resized_image.size,
         }
@@ -451,12 +495,12 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
             )
             for row in image_tokens.detach().to("cpu").tolist()
         ]
-        eol_token = self._apertus_special_token("eol_token", "<|extra_200|>")
+        eol_token = self._apertus_special_token("eol_token", self._APERTUS_DEFAULT_EOL_TOKEN)
         imgstr = eol_token.join(rows)
 
-        boi_token = self._apertus_special_token("boi_token", "<|image start|>")
-        img_token = self._apertus_special_token("img_token", "<|image token|>")
-        eoi_token = self._apertus_special_token("eoi_token", "<|image end|>")
+        boi_token = self._apertus_special_token("boi_token", self._APERTUS_DEFAULT_BOI_TOKEN)
+        img_token = self._apertus_special_token("img_token", self._APERTUS_DEFAULT_IMG_TOKEN)
+        eoi_token = self._apertus_special_token("eoi_token", self._APERTUS_DEFAULT_EOI_TOKEN)
 
         # Emu3.5 format: no trailing EOL, no EOF token.
         return f"{boi_token}{h}*{w}{img_token}{imgstr}{eoi_token}"
@@ -601,10 +645,19 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
             merged_prompt,
             tokenization_kwargs=effective_tokenization_kwargs,
         )
+        was_truncated = False
         if len(prompt_token_ids) > 8192:
             # print(f"Warning: Apertus Omni adapter generated {len(prompt_token_ids)} image prompts, which may exceed model context capacity.")
             # print(f"Image prompts: {image_prompts}")
             prompt_token_ids = prompt_token_ids[ : 75] + prompt_token_ids[len(prompt_token_ids) -8092 :]
+            was_truncated = True
+        dump_apertus_prompt_debug(
+            mm_processor_kwargs=mm_processor_kwargs,
+            merged_prompt=merged_prompt,
+            prompt_token_ids=prompt_token_ids,
+            image_count=len(image_prompts),
+            truncated=was_truncated,
+        )
         # logger.info(
         #     "Apertus Omni adapter merged %d image(s) into %d tokens.",
         #     len(image_prompts),
