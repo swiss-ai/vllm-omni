@@ -646,18 +646,14 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
             tokenization_kwargs=effective_tokenization_kwargs,
         )
         was_truncated = False
-        if len(prompt_token_ids) > 8192:
-            # print(f"Warning: Apertus Omni adapter generated {len(prompt_token_ids)} image prompts, which may exceed model context capacity.")
-            # print(f"Image prompts: {image_prompts}")
-            prompt_token_ids = prompt_token_ids[ : 75] + prompt_token_ids[len(prompt_token_ids) -8092 :]
-            was_truncated = True
-        dump_apertus_prompt_debug(
-            mm_processor_kwargs=mm_processor_kwargs,
-            merged_prompt=merged_prompt,
-            prompt_token_ids=prompt_token_ids,
-            image_count=len(image_prompts),
-            truncated=was_truncated,
-        )
+
+        # dump_apertus_prompt_debug(
+        #     mm_processor_kwargs=mm_processor_kwargs,
+        #     merged_prompt=merged_prompt,
+        #     prompt_token_ids=prompt_token_ids,
+        #     image_count=len(image_prompts),
+        #     truncated=was_truncated,
+        # )
         # logger.info(
         #     "Apertus Omni adapter merged %d image(s) into %d tokens.",
         #     len(image_prompts),

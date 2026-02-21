@@ -316,7 +316,7 @@ class AsyncOmni(OmniBase):
             self.stage_list[0].submit(task)
             metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
             _req_start_ts[request_id] = time.time()
-            logger.info(
+            logger.debug(
                 f"[{self._name}] Entering scheduling loop: stages={num_stages}, final_stage={final_stage_id_for_e2e}"
             )
             if self.async_chunk:
@@ -351,14 +351,14 @@ class AsyncOmni(OmniBase):
             # Summarize and print stats
             try:
                 summary = metrics.build_and_log_summary(final_stage_id_for_e2e)
-                logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
+                logger.debug("[Summary] %s", pformat(summary, sort_dicts=False))
             except Exception as e:
                 logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
             finally:
                 self.request_states.pop(request_id, None)
         except (asyncio.CancelledError, GeneratorExit):
             await self.abort(request_id)
-            logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
+            logger.debug("[AsyncOrchestrator] Request %s aborted.", request_id)
             raise
 
     async def _process_async_results(

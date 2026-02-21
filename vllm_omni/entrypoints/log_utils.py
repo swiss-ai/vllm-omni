@@ -547,7 +547,7 @@ class OrchestratorMetrics:
             "stages": stages_info,
         }
         self.sum_per_request_transfer_ms += float(pr.get("transfers_ms", 0.0))
-        logger.info(pformat(per_req_record, sort_dicts=False))
+        logger.debug(pformat(per_req_record, sort_dicts=False))
 
     def build_and_log_summary(self, final_stage_id_to_prompt: dict[str, int]) -> dict[str, Any]:
         # Compute stage summary using wall time between first input and last output per stage
