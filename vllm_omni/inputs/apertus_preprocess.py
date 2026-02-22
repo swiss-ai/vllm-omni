@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -13,6 +12,10 @@ from vllm.inputs.data import TextPrompt
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalInputs, MultiModalUUIDDict
 
+from vllm_omni.inputs.apertus_image_token_cache import (
+    ApertusImageTokenCacheConfig,
+    ApertusImageTokenSQLiteCache,
+)
 from vllm_omni.inputs.apertus_utils import (
     build_emu35_vision_tokenizer,
     dump_apertus_prompt_debug,
@@ -71,7 +74,7 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
         super().__init__(*args, **kwargs)
         self._apertus_vision_encoder_cache: dict[tuple[str, str, str, torch.dtype, bool], Any] = {}
         self._apertus_image_token_cache_db_path: Path | None = None
-        self._apertus_image_token_cache_conn: sqlite3.Connection | None = None
+        self._apertus_image_token_cache: ApertusImageTokenSQLiteCache | None = None
 
     def __del__(self):
         self._close_apertus_image_token_cache_connection()
@@ -364,7 +367,7 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
             "cache_version": self._APERTUS_IMAGE_TOKEN_CACHE_VERSION,
             "vq_hub": vq_hub,
             "vq_type": vq_type,
-            "vision_device": vision_device,
+            "vision_device": "cuda",
             "vision_dtype": str(vision_dtype),
             "trust_remote_code": trust_remote_code,
             "min_pixels": min_pixels,
@@ -393,95 +396,69 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
         return hasher.hexdigest()
 
     def _close_apertus_image_token_cache_connection(self) -> None:
-        cache_conn = getattr(self, "_apertus_image_token_cache_conn", None)
-        if cache_conn is not None:
-            try:
-                cache_conn.close()
-            except sqlite3.Error:
-                pass
-        self._apertus_image_token_cache_conn = None
+        cache_client = getattr(self, "_apertus_image_token_cache", None)
+        if cache_client is not None:
+            cache_client.close()
+        self._apertus_image_token_cache = None
         self._apertus_image_token_cache_db_path = None
 
-    def _get_apertus_image_token_cache_connection(
+    def _get_apertus_image_token_cache(
         self,
         cache_db_path: Path,
-    ) -> sqlite3.Connection | None:
+        mm_processor_kwargs: Mapping[str, Any] | None = None,
+    ) -> ApertusImageTokenSQLiteCache | None:
         cached_path = getattr(self, "_apertus_image_token_cache_db_path", None)
-        cached_conn = getattr(self, "_apertus_image_token_cache_conn", None)
-        if cached_conn is not None and cached_path == cache_db_path:
-            return cached_conn
+        cached_client = getattr(self, "_apertus_image_token_cache", None)
+        if cached_client is not None and cached_path == cache_db_path:
+            return cached_client
 
-        if cached_conn is not None:
+        if cached_client is not None:
             self._close_apertus_image_token_cache_connection()
 
+        cache_kwargs = mm_processor_kwargs or {}
         try:
-            cache_db_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_conn = sqlite3.connect(cache_db_path, timeout=30.0)
-            cache_conn.execute("PRAGMA journal_mode=WAL;")
-            cache_conn.execute("PRAGMA synchronous=NORMAL;")
-            cache_conn.execute("PRAGMA busy_timeout=5000;")
-            cache_conn.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {self._APERTUS_IMAGE_TOKEN_CACHE_TABLE} (
-                    cache_key TEXT PRIMARY KEY,
-                    image_prompt TEXT NOT NULL,
-                    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-                )
-                """
+            cache_config = ApertusImageTokenCacheConfig.from_mm_processor_kwargs(cache_kwargs)
+            cache_client = ApertusImageTokenSQLiteCache(
+                cache_db_path=cache_db_path,
+                table_name=self._APERTUS_IMAGE_TOKEN_CACHE_TABLE,
+                config=cache_config,
             )
-            cache_conn.commit()
-        except (OSError, sqlite3.Error) as exc:
+        except Exception as exc:
             logger.warning("Failed initializing Apertus image token SQLite cache %s: %s", cache_db_path, exc)
             return None
 
         self._apertus_image_token_cache_db_path = cache_db_path
-        self._apertus_image_token_cache_conn = cache_conn
-        return cache_conn
+        self._apertus_image_token_cache = cache_client
+        return cache_client
 
-    def _load_apertus_image_prompt_from_cache(self, cache_db_path: Path, cache_key: str) -> str | None:
-        cache_conn = self._get_apertus_image_token_cache_connection(cache_db_path)
-        if cache_conn is None:
+    def _load_apertus_image_prompt_from_cache(
+        self,
+        cache_db_path: Path,
+        cache_key: str,
+        mm_processor_kwargs: Mapping[str, Any] | None = None,
+    ) -> str | None:
+        cache_client = self._get_apertus_image_token_cache(
+            cache_db_path,
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        if cache_client is None:
             return None
+        return cache_client.get(cache_key)
 
-        try:
-            row = cache_conn.execute(
-                f"""
-                SELECT image_prompt
-                FROM {self._APERTUS_IMAGE_TOKEN_CACHE_TABLE}
-                WHERE cache_key = ?
-                """,
-                (cache_key,),
-            ).fetchone()
-        except sqlite3.Error as exc:
-            logger.warning("Failed reading Apertus image token SQLite cache %s: %s", cache_db_path, exc)
-            return None
-
-        if row is None:
-            return None
-        prompt = row[0]
-        return prompt if isinstance(prompt, str) and prompt else None
-
-    def _store_apertus_image_prompt_in_cache(self, cache_db_path: Path, cache_key: str, image_prompt: str) -> None:
-        cache_conn = self._get_apertus_image_token_cache_connection(cache_db_path)
-        if cache_conn is None:
+    def _store_apertus_image_prompt_in_cache(
+        self,
+        cache_db_path: Path,
+        cache_key: str,
+        image_prompt: str,
+        mm_processor_kwargs: Mapping[str, Any] | None = None,
+    ) -> None:
+        cache_client = self._get_apertus_image_token_cache(
+            cache_db_path,
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        if cache_client is None:
             return
-
-        try:
-            cache_conn.execute(
-                f"""
-                INSERT INTO {self._APERTUS_IMAGE_TOKEN_CACHE_TABLE} (cache_key, image_prompt)
-                VALUES (?, ?)
-                ON CONFLICT(cache_key) DO NOTHING
-                """,
-                (cache_key, image_prompt),
-            )
-            cache_conn.commit()
-        except sqlite3.Error as exc:
-            logger.warning("Failed writing Apertus image token SQLite cache %s: %s", cache_db_path, exc)
-            try:
-                cache_conn.rollback()
-            except sqlite3.Error:
-                pass
+        cache_client.put(cache_key, image_prompt)
 
     def _build_apertus_image_prompt(self, image_tokens: torch.Tensor) -> str:
         if image_tokens.ndim != 2:
@@ -587,7 +564,12 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
                     min_pixels=min_pixels,
                     max_pixels=max_pixels,
                 )
-                if cached_prompt := self._load_apertus_image_prompt_from_cache(cache_db_path, cache_key):
+                cached_prompt = self._load_apertus_image_prompt_from_cache(
+                    cache_db_path,
+                    cache_key,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                )
+                if cached_prompt:
                     image_prompts.append(cached_prompt)
                     continue
 
@@ -615,7 +597,12 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
             image_token_grid = self._extract_emu35_token_grid(encode_out, token_h, token_w)
             image_prompt = self._build_apertus_image_prompt(image_token_grid)
             if cache_db_path is not None and cache_key is not None:
-                self._store_apertus_image_prompt_in_cache(cache_db_path, cache_key, image_prompt)
+                self._store_apertus_image_prompt_in_cache(
+                    cache_db_path,
+                    cache_key,
+                    image_prompt,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                )
             image_prompts.append(image_prompt)
 
         return image_prompts
