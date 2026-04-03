@@ -1,3 +1,4 @@
+import importlib
 import json
 import importlib.util
 import os
@@ -16,6 +17,8 @@ _EMU35_VISION_TOKENIZER_MODULE = "_vllm_omni_external_emu35_vision_tokenizer"
 _EMU35_VQ_REQUIRED_FILES = ("config.yaml", "model.ckpt")
 _APERTUS_PROMPT_DUMP_ENV_VAR = "VLLM_OMNI_APERTUS_PROMPT_DUMP_PATH"
 _APERTUS_PROMPT_DUMP_KWARG = "apertus_prompt_dump_path"
+_APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR = "VLLM_OMNI_APERTUS_AUDIO_TOKENIZER_CODEBASE"
+_APERTUS_AUDIO_TOKENIZER_REPO_NAME = "benchmark-audio-tokenizer"
 
 
 def get_default_cache_dir() -> Path:
@@ -190,3 +193,67 @@ def dump_apertus_prompt_debug(
             dump_path,
             exc,
         )
+
+
+def resolve_apertus_audio_tokenizer_codebase(codebase_path: str | None = None) -> Path:
+    def _is_valid_wavtokenizer_codebase(candidate: Path) -> bool:
+        return all(
+            path.is_file()
+            for path in (
+                candidate / "src" / "audio_tokenizers" / "implementations" / "wavtokenizer.py",
+                candidate / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
+                candidate / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
+            )
+        )
+
+    candidates: list[Path] = []
+    explicit = codebase_path or os.getenv(_APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR)
+    if explicit:
+        candidates.append(Path(os.path.expandvars(explicit)).expanduser())
+
+    sibling_repo = Path(__file__).resolve().parents[4] / _APERTUS_AUDIO_TOKENIZER_REPO_NAME
+    candidates.append(sibling_repo)
+
+    for candidate in candidates:
+        if _is_valid_wavtokenizer_codebase(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        "Unable to locate a complete benchmark-audio-tokenizer checkout required for Apertus audio tokenization. "
+        "The codebase must include both the wrapper module and the underlying "
+        "`src/repos/wavtokenizer` source tree. "
+        f"Set {_APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR} or place a complete repo at {sibling_repo}."
+    )
+
+
+@lru_cache(maxsize=4)
+def _load_wavtokenizer40_class(codebase_path: str) -> Any:
+    resolved_codebase = resolve_apertus_audio_tokenizer_codebase(codebase_path)
+    codebase_str = str(resolved_codebase)
+    if codebase_str not in sys.path:
+        sys.path.insert(0, codebase_str)
+
+    module = importlib.import_module("src.audio_tokenizers.implementations.wavtokenizer")
+    wavtokenizer_cls = getattr(module, "WavTokenizer40", None)
+    if wavtokenizer_cls is None:
+        raise AttributeError("benchmark-audio-tokenizer does not expose WavTokenizer40.")
+    return wavtokenizer_cls
+
+
+def build_apertus_wavtokenizer(
+    *,
+    checkpoint_path: str | None = None,
+    codebase_path: str | None = None,
+    device: str = "cuda",
+    torch_compile: bool = False,
+) -> Any:
+    wavtokenizer_cls = _load_wavtokenizer40_class(
+        str(resolve_apertus_audio_tokenizer_codebase(codebase_path))
+    )
+    kwargs = {
+        "device": device,
+        "torch_compile": torch_compile,
+    }
+    if checkpoint_path is not None:
+        kwargs["checkpoint"] = checkpoint_path
+    return wavtokenizer_cls(**kwargs)

@@ -6,11 +6,13 @@ import pytest
 import torch
 from PIL import Image
 
-import vllm_omni.inputs.apertus_preprocess as apertus_preprocess
-from vllm_omni.inputs.apertus_preprocess import (
+import vllm_omni.inputs.apertus.modalities.image as image_mod
+from vllm_omni.inputs.apertus.modalities.image import ImageModalityEncoder
+from vllm_omni.inputs.apertus.preprocessor import (
     ApertusOmniInputPreprocessor,
     is_apertus_model_config,
 )
+from vllm_omni.inputs.apertus.types import ModalityContext, StringPiece, TokenPiece
 from vllm_omni.inputs.apertus_utils import ensure_local_weights
 
 
@@ -19,13 +21,62 @@ def _make_apertus_preprocessor(monkeypatch):
     preprocessor.model_config = SimpleNamespace(
         hf_config=SimpleNamespace(model_type="apertus", architectures=["ApertusForCausalLM"])
     )
+    preprocessor._modality_encoders = {"image": object()}
     monkeypatch.setattr(preprocessor, "_tokenize_prompt", lambda prompt_text, tokenization_kwargs=None: [9, 8, 7])
     monkeypatch.setattr(
         preprocessor,
-        "_process_apertus_text_with_images",
+        "_process_apertus_prompt",
         lambda *args, **kwargs: {"prompt_token_ids": [4, 5, 6]},
     )
     return preprocessor
+
+
+class _FakeImageEncoder:
+    modality = "image"
+
+    def placeholder_aliases(self, prompt_text, ctx):
+        del prompt_text, ctx
+        return ["<|image|>"]
+
+    def normalize_inputs(self, raw_input, ctx):
+        del ctx
+        return list(raw_input or [])
+
+    def encode_many(self, items, ctx):
+        del items, ctx
+        return [StringPiece("<img_prompt>")]
+
+
+class _SharedAliasImageEncoder:
+    modality = "image"
+
+    def placeholder_aliases(self, prompt_text, ctx):
+        del prompt_text, ctx
+        return ["<|shared|>"]
+
+    def normalize_inputs(self, raw_input, ctx):
+        del raw_input, ctx
+        return []
+
+    def encode_many(self, items, ctx):
+        del items, ctx
+        return []
+
+
+class _SharedAliasAudioEncoder:
+    modality = "audio"
+
+    def placeholder_aliases(self, prompt_text, ctx):
+        del prompt_text, ctx
+        return ["<|shared|>"]
+
+    def normalize_inputs(self, raw_input, ctx):
+        del ctx
+        return list(raw_input or [])
+
+    def encode_many(self, items, ctx):
+        del items, ctx
+        return [TokenPiece([11, 12, 13])]
 
 
 def test_is_apertus_model_config_true():
@@ -44,9 +95,10 @@ def test_is_apertus_model_config_false():
 
 def test_apertus_adapter_rejects_unsupported_modalities():
     preprocessor = object.__new__(ApertusOmniInputPreprocessor)
-    with pytest.raises(ValueError, match="text and image inputs only"):
-        preprocessor._is_apertus_text_image_input(
-            {"image": [object()], "audio": [object()]},
+    preprocessor._modality_encoders = {"image": object(), "audio": object()}
+    with pytest.raises(ValueError, match="supports only these extra modalities"):
+        preprocessor._is_apertus_multimodal_input(
+            {"image": [object()], "video": [object()]},
         )
 
 
@@ -63,8 +115,8 @@ def test_process_text_uses_apertus_adapter_path(monkeypatch):
 
 
 def test_build_apertus_image_prompt_uses_emu35_format_without_eof():
-    preprocessor = object.__new__(ApertusOmniInputPreprocessor)
-    preprocessor.tokenizer = SimpleNamespace(
+    encoder = ImageModalityEncoder()
+    tokenizer = SimpleNamespace(
         boi_token="<|image start|>",
         img_token="<|image token|>",
         eol_token="<|extra_200|>",
@@ -72,10 +124,7 @@ def test_build_apertus_image_prompt_uses_emu35_format_without_eof():
     )
 
     token_grid = torch.tensor([[5, 6], [7, 8]])
-    image_prompt = ApertusOmniInputPreprocessor._build_apertus_image_prompt(
-        preprocessor,
-        token_grid,
-    )
+    image_prompt = encoder._build_apertus_image_prompt(token_grid, tokenizer)
 
     assert image_prompt == (
         "<|image start|>2*2<|image token|>"
@@ -89,7 +138,7 @@ def test_build_apertus_image_prompt_uses_emu35_format_without_eof():
 def test_extract_emu35_token_grid_handles_nested_none_tuple():
     token_ids = torch.arange(6, dtype=torch.int64)
     encode_out = (torch.zeros(1), None, (None, None, token_ids))
-    image_token_grid = ApertusOmniInputPreprocessor._extract_emu35_token_grid(
+    image_token_grid = ImageModalityEncoder._extract_emu35_token_grid(
         encode_out,
         token_height=2,
         token_width=3,
@@ -99,24 +148,11 @@ def test_extract_emu35_token_grid_handles_nested_none_tuple():
     assert image_token_grid.tolist() == [[0, 1, 2], [3, 4, 5]]
 
 
-def test_process_apertus_text_sets_add_special_tokens_false_by_default(monkeypatch):
+def test_process_apertus_prompt_sets_add_special_tokens_false_by_default(monkeypatch):
     preprocessor = object.__new__(ApertusOmniInputPreprocessor)
     preprocessor.tokenizer = SimpleNamespace()
-    monkeypatch.setattr(
-        preprocessor,
-        "_normalize_apertus_images",
-        lambda image_data: [object()],
-    )
-    monkeypatch.setattr(
-        preprocessor,
-        "_encode_apertus_images_to_strings",
-        lambda images, mm_processor_kwargs: ["<img_prompt>"],
-    )
-    monkeypatch.setattr(
-        preprocessor,
-        "_resolve_apertus_image_placeholder",
-        lambda prompt_text, mm_processor_kwargs: "<|image|>",
-    )
+    preprocessor.model_config = None
+    preprocessor._modality_encoders = {"image": _FakeImageEncoder()}
     captured = {}
 
     def _fake_tokenize(prompt_text, tokenization_kwargs=None):
@@ -126,7 +162,7 @@ def test_process_apertus_text_sets_add_special_tokens_false_by_default(monkeypat
 
     monkeypatch.setattr(preprocessor, "_tokenize_prompt", _fake_tokenize)
 
-    inputs = ApertusOmniInputPreprocessor._process_apertus_text_with_images(
+    inputs = ApertusOmniInputPreprocessor._process_apertus_prompt(
         preprocessor,
         prompt_text="hello <|image|>",
         multi_modal_data={"image": [object()]},
@@ -139,9 +175,36 @@ def test_process_apertus_text_sets_add_special_tokens_false_by_default(monkeypat
     assert captured["tokenization_kwargs"]["add_special_tokens"] is False
 
 
-def test_encode_apertus_images_reads_prompt_from_sqlite_cache_without_encoder(monkeypatch, tmp_path):
+def test_process_apertus_prompt_supports_shared_placeholder_for_active_modality(monkeypatch):
     preprocessor = object.__new__(ApertusOmniInputPreprocessor)
-    preprocessor.tokenizer = SimpleNamespace(
+    preprocessor.tokenizer = SimpleNamespace()
+    preprocessor.model_config = None
+    preprocessor._modality_encoders = {
+        "image": _SharedAliasImageEncoder(),
+        "audio": _SharedAliasAudioEncoder(),
+    }
+
+    def _fake_tokenize(prompt_text, tokenization_kwargs=None):
+        assert prompt_text == "listen "
+        assert tokenization_kwargs["add_special_tokens"] is False
+        return [7]
+
+    monkeypatch.setattr(preprocessor, "_tokenize_prompt", _fake_tokenize)
+
+    inputs = ApertusOmniInputPreprocessor._process_apertus_prompt(
+        preprocessor,
+        prompt_text="listen <|shared|>",
+        multi_modal_data={"audio": [("fake", 16000)]},
+        mm_processor_kwargs={"apertus_audio_placeholder": "<|shared|>"},
+        tokenization_kwargs=None,
+    )
+
+    assert inputs["prompt_token_ids"] == [7, 11, 12, 13]
+
+
+def test_encode_apertus_images_reads_prompt_from_sqlite_cache_without_encoder(monkeypatch, tmp_path):
+    encoder = ImageModalityEncoder()
+    tokenizer = SimpleNamespace(
         boi_token="<|image start|>",
         img_token="<|image token|>",
         eol_token="<|extra_200|>",
@@ -154,38 +217,37 @@ def test_encode_apertus_images_reads_prompt_from_sqlite_cache_without_encoder(mo
         "apertus_image_token_cache": True,
         "apertus_image_token_cache_dir": str(tmp_path / "apertus_cache"),
     }
-    cache_db_path = preprocessor._resolve_apertus_image_token_cache_db_path(mm_processor_kwargs)
+    cache_db_path = encoder._resolve_apertus_image_token_cache_db_path(mm_processor_kwargs)
     assert cache_db_path is not None
 
-    resized_image = preprocessor._smart_resize(
+    resized_image = encoder._smart_resize(
         image,
         area=256,
-        ds_factor=preprocessor._APERTUS_EMU35_DS_FACTOR,
+        ds_factor=encoder._APERTUS_EMU35_DS_FACTOR,
     )
-    cache_key = preprocessor._build_apertus_image_prompt_cache_key(
+    cache_key = encoder._build_apertus_image_prompt_cache_key(
         resized_image,
+        tokenizer=tokenizer,
         mm_processor_kwargs=mm_processor_kwargs,
         min_pixels=256,
         max_pixels=256,
     )
     expected_prompt = "<cached-image-prompt>"
-    preprocessor._store_apertus_image_prompt_in_cache(cache_db_path, cache_key, expected_prompt)
+    encoder._store_apertus_image_prompt_in_cache(cache_db_path, cache_key, expected_prompt)
 
     def _fail_if_called(*args, **kwargs):
         raise AssertionError("vision tokenizer should not be loaded when cache hit exists")
 
-    monkeypatch.setattr(preprocessor, "_get_apertus_vision_components", _fail_if_called)
+    monkeypatch.setattr(encoder, "_get_apertus_vision_components", _fail_if_called)
 
-    image_prompts = preprocessor._encode_apertus_images_to_strings(
-        [image],
-        mm_processor_kwargs=mm_processor_kwargs,
-    )
-    assert image_prompts == [expected_prompt]
+    ctx = ModalityContext(tokenizer=tokenizer, model_config=None, mm_processor_kwargs=mm_processor_kwargs)
+    image_prompts = encoder.encode_many([image], ctx)
+    assert image_prompts == [StringPiece(expected_prompt)]
 
 
 def test_encode_apertus_images_writes_sqlite_cache_and_reuses_it(monkeypatch, tmp_path):
-    preprocessor = object.__new__(ApertusOmniInputPreprocessor)
-    preprocessor.tokenizer = SimpleNamespace(
+    encoder = ImageModalityEncoder()
+    tokenizer = SimpleNamespace(
         boi_token="<|image start|>",
         img_token="<|image token|>",
         eol_token="<|extra_200|>",
@@ -213,31 +275,30 @@ def test_encode_apertus_images_writes_sqlite_cache_and_reuses_it(monkeypatch, tm
 
     fake_vision_tokenizer = _FakeVisionTokenizer()
     monkeypatch.setattr(
-        preprocessor,
+        encoder,
         "_get_apertus_vision_components",
         lambda _kwargs: fake_vision_tokenizer,
     )
     monkeypatch.setattr(
-        preprocessor,
+        encoder,
         "_extract_emu35_token_grid",
         lambda encode_out, token_height, token_width: torch.tensor([[5]], dtype=torch.int64),
     )
 
-    first = preprocessor._encode_apertus_images_to_strings(
-        [image],
-        mm_processor_kwargs=mm_processor_kwargs,
-    )
+    ctx = ModalityContext(tokenizer=tokenizer, model_config=None, mm_processor_kwargs=mm_processor_kwargs)
+    first = encoder.encode_many([image], ctx)
     assert fake_vision_tokenizer.encode_calls == 1
 
-    cache_db_path = preprocessor._resolve_apertus_image_token_cache_db_path(mm_processor_kwargs)
+    cache_db_path = encoder._resolve_apertus_image_token_cache_db_path(mm_processor_kwargs)
     assert cache_db_path is not None
-    resized_image = preprocessor._smart_resize(
+    resized_image = encoder._smart_resize(
         image,
         area=256,
-        ds_factor=preprocessor._APERTUS_EMU35_DS_FACTOR,
+        ds_factor=encoder._APERTUS_EMU35_DS_FACTOR,
     )
-    cache_key = preprocessor._build_apertus_image_prompt_cache_key(
+    cache_key = encoder._build_apertus_image_prompt_cache_key(
         resized_image,
+        tokenizer=tokenizer,
         mm_processor_kwargs=mm_processor_kwargs,
         min_pixels=256,
         max_pixels=256,
@@ -247,22 +308,19 @@ def test_encode_apertus_images_writes_sqlite_cache_and_reuses_it(monkeypatch, tm
         row = conn.execute(
             f"""
             SELECT image_prompt
-            FROM {preprocessor._APERTUS_IMAGE_TOKEN_CACHE_TABLE}
+            FROM {encoder._APERTUS_IMAGE_TOKEN_CACHE_TABLE}
             WHERE cache_key = ?
             """,
             (cache_key,),
         ).fetchone()
     assert row is not None
-    assert row[0] == first[0]
+    assert row[0] == first[0].text
 
     def _fail_if_called(*args, **kwargs):
         raise AssertionError("vision tokenizer should not be loaded on second call")
 
-    monkeypatch.setattr(preprocessor, "_get_apertus_vision_components", _fail_if_called)
-    second = preprocessor._encode_apertus_images_to_strings(
-        [image],
-        mm_processor_kwargs=mm_processor_kwargs,
-    )
+    monkeypatch.setattr(encoder, "_get_apertus_vision_components", _fail_if_called)
+    second = encoder.encode_many([image], ctx)
     assert second == first
 
 
@@ -275,7 +333,7 @@ def test_ensure_local_weights_uses_existing_local_checkpoint(tmp_path):
 
 
 def test_load_vision_tokenizer_uses_build_vision_tokenizer(monkeypatch):
-    preprocessor = object.__new__(ApertusOmniInputPreprocessor)
+    encoder = ImageModalityEncoder()
     calls = {}
 
     class _FakeVisionTokenizer:
@@ -293,13 +351,12 @@ def test_load_vision_tokenizer_uses_build_vision_tokenizer(monkeypatch):
         return fake_vision_tokenizer
 
     monkeypatch.setattr(
-        apertus_preprocess,
+        image_mod,
         "build_emu35_vision_tokenizer",
         _fake_builder,
     )
 
-    output = ApertusOmniInputPreprocessor._load_vision_tokenizer(
-        preprocessor,
+    output = encoder._load_vision_tokenizer(
         vq_hub="BAAI/Emu3.5-VisionTokenizer",
         device="cuda:0",
         torch_dtype=torch.bfloat16,
@@ -318,8 +375,7 @@ def test_load_vision_tokenizer_uses_build_vision_tokenizer(monkeypatch):
 
 
 def test_get_apertus_vision_components_caches_loader_result(monkeypatch):
-    preprocessor = object.__new__(ApertusOmniInputPreprocessor)
-    preprocessor._apertus_vision_encoder_cache = {}
+    encoder = ImageModalityEncoder()
     fake_vision_tokenizer = object()
     call_count = {"n": 0}
 
@@ -329,40 +385,27 @@ def test_get_apertus_vision_components_caches_loader_result(monkeypatch):
         assert kwargs["type"] == "ibq"
         return fake_vision_tokenizer
 
-    monkeypatch.setattr(preprocessor, "_load_vision_tokenizer", _fake_load_vision_tokenizer)
+    monkeypatch.setattr(encoder, "_load_vision_tokenizer", _fake_load_vision_tokenizer)
 
     mm_kwargs = {
         "apertus_vq_hub": "BAAI/Emu3.5-VisionTokenizer",
         "apertus_vision_tokenizer_device": "cpu",
         "apertus_vision_tokenizer_dtype": "float32",
     }
-    first = ApertusOmniInputPreprocessor._get_apertus_vision_components(preprocessor, mm_kwargs)
-    second = ApertusOmniInputPreprocessor._get_apertus_vision_components(preprocessor, mm_kwargs)
+    first = encoder._get_apertus_vision_components(mm_kwargs)
+    second = encoder._get_apertus_vision_components(mm_kwargs)
 
     assert first is fake_vision_tokenizer
     assert second is fake_vision_tokenizer
     assert call_count["n"] == 1
 
 
-def test_process_apertus_text_dumps_merged_prompt_and_tokens(monkeypatch, tmp_path):
+def test_process_apertus_prompt_dumps_merged_prompt_and_tokens(monkeypatch, tmp_path):
     preprocessor = object.__new__(ApertusOmniInputPreprocessor)
     preprocessor.tokenizer = SimpleNamespace()
+    preprocessor.model_config = None
+    preprocessor._modality_encoders = {"image": _FakeImageEncoder()}
 
-    monkeypatch.setattr(
-        preprocessor,
-        "_normalize_apertus_images",
-        lambda image_data: [object()],
-    )
-    monkeypatch.setattr(
-        preprocessor,
-        "_encode_apertus_images_to_strings",
-        lambda images, mm_processor_kwargs: ["<img_prompt>"],
-    )
-    monkeypatch.setattr(
-        preprocessor,
-        "_resolve_apertus_image_placeholder",
-        lambda prompt_text, mm_processor_kwargs: "<|image|>",
-    )
     monkeypatch.setattr(
         preprocessor,
         "_tokenize_prompt",
@@ -370,7 +413,7 @@ def test_process_apertus_text_dumps_merged_prompt_and_tokens(monkeypatch, tmp_pa
     )
 
     dump_path = tmp_path / "apertus_prompts.jsonl"
-    inputs = ApertusOmniInputPreprocessor._process_apertus_text_with_images(
+    inputs = ApertusOmniInputPreprocessor._process_apertus_prompt(
         preprocessor,
         prompt_text="hello <|image|>",
         multi_modal_data={"image": [object()]},
